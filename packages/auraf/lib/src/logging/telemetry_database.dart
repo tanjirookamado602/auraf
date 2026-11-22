@@ -1,97 +1,69 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:path/path.dart' as path;
+import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
-const String benchmarkCsvHeader =
-    'run_id,timestamp,device_model,network_condition,context_budget,placement,'
-    'ttft_ms,total_latency_ms,tokens_per_sec,energy_mah,peak_memory_mb,'
-    'temp_celsius,cost_usd,quality_score,constraint_violated';
+import '../collector/telemetry_sample.dart';
+import '../models/benchmark_record.dart';
 
-class BenchmarkRecord {
-  const BenchmarkRecord({
-    required this.runId,
-    required this.timestamp,
-    required this.deviceModel,
-    required this.networkCondition,
-    required this.contextBudget,
-    required this.placement,
-    required this.ttftMs,
-    required this.totalLatencyMs,
-    required this.tokensPerSec,
-    required this.energyMah,
-    required this.peakMemoryMb,
-    required this.tempCelsius,
-    required this.costUsd,
-    required this.qualityScore,
-    required this.constraintViolated,
-  });
-
-  final String runId;
-  final int timestamp;
-  final String deviceModel;
-  final String networkCondition;
-  final int contextBudget;
-  final String placement;
-  final double ttftMs;
-  final double totalLatencyMs;
-  final double tokensPerSec;
-  final double energyMah;
-  final double peakMemoryMb;
-  final double tempCelsius;
-  final double costUsd;
-  final double qualityScore;
-  final bool constraintViolated;
-
-  Map<String, Object> toMap() => <String, Object>{
-        'run_id': runId,
-        'timestamp': timestamp,
-        'device_model': deviceModel,
-        'network_condition': networkCondition,
-        'context_budget': contextBudget,
-        'placement': placement,
-        'ttft_ms': ttftMs,
-        'total_latency_ms': totalLatencyMs,
-        'tokens_per_sec': tokensPerSec,
-        'energy_mah': energyMah,
-        'peak_memory_mb': peakMemoryMb,
-        'temp_celsius': tempCelsius,
-        'cost_usd': costUsd,
-        'quality_score': qualityScore,
-        'constraint_violated': constraintViolated ? 1 : 0,
-      };
-
-  String toCsvRow() => toMap().values.map(_csvValue).join(',');
-
-  static String _csvValue(Object? value) {
-    final text = value.toString();
-    if (text.contains(',') || text.contains('"') || text.contains('\n')) {
-      return '"${text.replaceAll('"', '""')}"';
-    }
-    return text;
-  }
-}
-
+/// Local SQLite telemetry log for AURAF.
+///
+/// * `benchmark_records`: one row per run, exact DDL from
+///   `docs/SHARED_DATA_CONTRACT.md` §4.
+/// * `device_state_samples`: every State Collector reading taken during a run
+///   (or during live monitoring), using the contract `DeviceState` column
+///   names plus collector diagnostics.
+///
+/// sqflite executes queries on a native background thread, so logging never
+/// blocks the UI isolate. Each run's record and samples are written in one
+/// transaction.
 class TelemetryDatabase {
-  TelemetryDatabase({String? databasePath}) : _databasePath = databasePath;
+  TelemetryDatabase({String? databasePath, DatabaseFactory? factory})
+      : _databasePath = databasePath,
+        _factory = factory;
 
-  static const String databaseName = 'auraf_telemetry.sqlite';
+  static const String databaseName = 'auraf_telemetry.db';
+  static const int schemaVersion = 2;
+
+  static const String samplesCsvHeader =
+      'run_id,timestamp,battery_level_percent,battery_current_ma,'
+      'temperature_celsius,available_ram_mb,peak_memory_mb,network_condition,'
+      'context_size_tokens,remaining_budget_usd,rss_mb,thermal_status,'
+      'is_charging,sample_latency_ms';
+
   final String? _databasePath;
-  Database? _database;
+  final DatabaseFactory? _factory;
+  Future<Database>? _opening;
+  String? _resolvedPath;
 
-  Future<Database> get database async {
-    return _database ??= await _open();
-  }
+  /// Absolute path of the database file once opened.
+  String? get path => _resolvedPath;
+
+  Future<Database> get database => _opening ??= _open();
 
   Future<Database> _open() async {
-    final location =
-        _databasePath ?? path.join(await getDatabasesPath(), databaseName);
-    return openDatabase(
+    final factory = _factory ?? databaseFactory;
+    final location = _databasePath ??
+        p.join(await factory.getDatabasesPath(), databaseName);
+    _resolvedPath = location;
+    return factory.openDatabase(
       location,
-      version: 1,
-      onCreate: (db, version) async {
-        await db.execute('''
+      options: OpenDatabaseOptions(
+        version: schemaVersion,
+        onCreate: (db, _) async {
+          await _createRecordsTable(db);
+          await _createSamplesTable(db);
+        },
+        onUpgrade: (db, from, _) async {
+          if (from < 2) await _createSamplesTable(db);
+        },
+      ),
+    );
+  }
+
+  static Future<void> _createRecordsTable(Database db) async {
+    await db.execute('''
 CREATE TABLE IF NOT EXISTS benchmark_records (
     run_id TEXT PRIMARY KEY,
     timestamp INTEGER NOT NULL,
@@ -108,56 +80,170 @@ CREATE TABLE IF NOT EXISTS benchmark_records (
     cost_usd REAL NOT NULL,
     quality_score REAL NOT NULL,
     constraint_violated INTEGER NOT NULL
-);
-''');
-        await db.execute(
-          'CREATE INDEX IF NOT EXISTS idx_records_timestamp '
-          'ON benchmark_records(timestamp)',
-        );
-        await db.execute(
-          'CREATE INDEX IF NOT EXISTS idx_records_placement '
-          'ON benchmark_records(placement)',
-        );
-        await db.execute(
-          'CREATE INDEX IF NOT EXISTS idx_records_network '
-          'ON benchmark_records(network_condition)',
-        );
-      },
-    );
+)''');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_records_timestamp '
+        'ON benchmark_records(timestamp)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_records_placement '
+        'ON benchmark_records(placement)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_records_network '
+        'ON benchmark_records(network_condition)');
   }
 
-  Future<void> insert(BenchmarkRecord record) async {
-    final db = await database;
-    await db.insert(
-      'benchmark_records',
-      record.toMap(),
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+  static Future<void> _createSamplesTable(Database db) async {
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS device_state_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    timestamp INTEGER NOT NULL,
+    battery_level_percent INTEGER NOT NULL,
+    battery_current_ma REAL NOT NULL,
+    temperature_celsius REAL NOT NULL,
+    available_ram_mb REAL NOT NULL,
+    peak_memory_mb REAL NOT NULL,
+    network_condition TEXT NOT NULL,
+    context_size_tokens INTEGER NOT NULL,
+    remaining_budget_usd REAL NOT NULL,
+    rss_mb REAL NOT NULL,
+    thermal_status INTEGER NOT NULL,
+    is_charging INTEGER NOT NULL,
+    sample_latency_ms REAL NOT NULL
+)''');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_samples_run '
+        'ON device_state_samples(run_id)');
   }
 
-  Future<int> count() async => (await database)
-      .rawQuery('SELECT COUNT(*) AS count FROM benchmark_records')
-      .then((rows) => Sqflite.firstIntValue(rows) ?? 0);
+  static Map<String, Object?> _sampleRow(
+    TelemetrySample s, {
+    required String? runId,
+    required int contextSizeTokens,
+    required double remainingBudgetUsd,
+  }) =>
+      <String, Object?>{
+        'run_id': runId,
+        ...s
+            .toDeviceState(
+              contextSizeTokens: contextSizeTokens,
+              remainingBudgetUsd: remainingBudgetUsd,
+            )
+            .toMap(),
+        'rss_mb': s.rssMb,
+        'thermal_status': s.thermalStatus,
+        'is_charging': s.isCharging ? 1 : 0,
+        'sample_latency_ms': s.sampleLatencyMs,
+      };
 
-  Future<File> exportToCsv({
-    String outputPath = 'results/m2_benchmark_results.csv',
+  /// Writes a run's record and its telemetry samples atomically.
+  Future<void> logRun(
+    BenchmarkRecord record, {
+    List<TelemetrySample> samples = const <TelemetrySample>[],
+    double remainingBudgetUsd = 0,
   }) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final batch = txn.batch()
+        ..insert(
+          'benchmark_records',
+          record.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      for (final s in samples) {
+        batch.insert(
+          'device_state_samples',
+          _sampleRow(
+            s,
+            runId: record.runId,
+            contextSizeTokens: record.contextBudget,
+            remainingBudgetUsd: remainingBudgetUsd,
+          ),
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  /// Logs live-monitor readings that do not belong to a benchmark run.
+  Future<void> logSamples(
+    List<TelemetrySample> samples, {
+    String? runId,
+    int contextSizeTokens = 0,
+    double remainingBudgetUsd = 0,
+  }) async {
+    if (samples.isEmpty) return;
+    final batch = (await database).batch();
+    for (final s in samples) {
+      batch.insert(
+        'device_state_samples',
+        _sampleRow(
+          s,
+          runId: runId,
+          contextSizeTokens: contextSizeTokens,
+          remainingBudgetUsd: remainingBudgetUsd,
+        ),
+      );
+    }
+    await batch.commit(noResult: true);
+  }
+
+  Future<List<BenchmarkRecord>> records({int? limit, bool newestFirst = false}) async {
     final rows = await (await database).query(
       'benchmark_records',
-      orderBy: 'timestamp ASC, run_id ASC',
+      orderBy: newestFirst ? 'timestamp DESC, run_id DESC' : 'timestamp ASC, run_id ASC',
+      limit: limit,
     );
+    return rows.map(BenchmarkRecord.fromMap).toList(growable: false);
+  }
+
+  Future<int> recordCount() => _count('benchmark_records');
+  Future<int> sampleCount() => _count('device_state_samples');
+
+  Future<int> _count(String table) async {
+    final rows = await (await database).rawQuery('SELECT COUNT(*) FROM $table');
+    return Sqflite.firstIntValue(rows) ?? 0;
+  }
+
+  Future<void> clear() async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('benchmark_records');
+      await txn.delete('device_state_samples');
+    });
+  }
+
+  /// Contract CSV (§5): exact header, records ordered by time.
+  Future<String> recordsCsv() async {
+    final buffer = StringBuffer(BenchmarkRecord.csvHeader)..write('\n');
+    for (final r in await records()) {
+      buffer
+        ..write(r.toCsvRow())
+        ..write('\n');
+    }
+    return buffer.toString();
+  }
+
+  Future<String> samplesCsv() async {
+    final rows = await (await database).query(
+      'device_state_samples',
+      orderBy: 'timestamp ASC, id ASC',
+    );
+    final columns = samplesCsvHeader.split(',');
+    final buffer = StringBuffer(samplesCsvHeader)..write('\n');
+    for (final row in rows) {
+      buffer
+        ..write(columns.map((c) => row[c]?.toString() ?? '').join(','))
+        ..write('\n');
+    }
+    return buffer.toString();
+  }
+
+  Future<File> exportRecordsCsv(String outputPath) async {
     final file = File(outputPath);
     await file.parent.create(recursive: true);
-    final contents = StringBuffer('$benchmarkCsvHeader\n');
-    for (final row in rows) {
-      contents.writeln(row.values.map(BenchmarkRecord._csvValue).join(','));
-    }
-    return file.writeAsString(contents.toString());
+    return file.writeAsString(await recordsCsv(), flush: true);
   }
 
   Future<void> close() async {
-    final db = _database;
-    _database = null;
-    await db?.close();
+    final opening = _opening;
+    _opening = null;
+    if (opening != null) await (await opening).close();
   }
 }

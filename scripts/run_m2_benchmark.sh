@@ -1,66 +1,113 @@
 #!/usr/bin/env bash
+# AURAF Milestone 2: one-command automated benchmark.
+#
+# Launches the harness app on a connected Android phone or emulator, runs the
+# network x context x placement x repetition matrix, and writes the results to
+# results/ on this computer:
+#   m2_benchmark_results.csv      contract CSV (15 columns, one row per run)
+#   m2_device_state_samples.csv   every 10 Hz State Collector reading
+#   m2_run_summary.json           overhead, violations, energy source, config
+#   auraf_telemetry.db            the SQLite database pulled from the device
+#
+# Usage: scripts/run_m2_benchmark.sh [--reps N] [--device SERIAL] [--emulator AVD]
+#                                    [--cooldown CELSIUS] [--seed N]
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESULT_FILE="${ROOT_DIR}/results/m2_benchmark_results.csv"
+RESULTS_DIR="${ROOT_DIR}/results"
+RESULT_FILE="${RESULTS_DIR}/m2_benchmark_results.csv"
+REPS=5
+COOLDOWN=35
+SEED=42
+DEVICE="${ANDROID_SERIAL:-}"
+AVD=""
 
-if ! command -v adb >/dev/null 2>&1; then
-  echo "error: adb is required but was not found in PATH" >&2
-  exit 1
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --reps) REPS="$2"; shift 2 ;;
+    --device|-d) DEVICE="$2"; shift 2 ;;
+    --emulator) AVD="$2"; shift 2 ;;
+    --cooldown) COOLDOWN="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    *) echo "error: unknown option $1" >&2; usage 1 ;;
+  esac
+done
+[[ "${REPS}" =~ ^[1-9][0-9]*$ ]] || { echo "error: --reps must be a positive integer" >&2; exit 1; }
+
+# adb ships with the Android SDK but is often not on PATH.
+SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+export PATH="${SDK}/platform-tools:${SDK}/emulator:${PATH}"
+command -v adb >/dev/null || { echo "error: adb not found (set ANDROID_HOME)" >&2; exit 1; }
+command -v flutter >/dev/null || { echo "error: flutter not found in PATH" >&2; exit 1; }
+
+ready_devices() { adb devices | awk 'NR > 1 && $2 == "device" {print $1}'; }
+
+if [[ -n "${AVD}" ]] && [[ -z "$(ready_devices)" ]]; then
+  echo "==> Booting emulator ${AVD}"
+  nohup emulator -avd "${AVD}" -no-snapshot-save -no-audio >/dev/null 2>&1 &
+  adb wait-for-device
+  until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; do sleep 2; done
 fi
 
-mapfile -t DEVICES < <(adb devices | awk 'NR > 1 && $2 == "device" {print $1}')
-if [[ "${#DEVICES[@]}" -eq 0 ]]; then
-  echo "error: no connected Android device is ready (adb devices)" >&2
-  exit 1
+mapfile -t DEVICES < <(ready_devices)
+if [[ -z "${DEVICE}" ]]; then
+  if [[ "${#DEVICES[@]}" -eq 0 ]]; then
+    echo "error: no Android device or emulator is ready (adb devices)." >&2
+    echo "       Plug in a phone with USB debugging, or pass --emulator <AVD> (see: flutter emulators)." >&2
+    exit 1
+  elif [[ "${#DEVICES[@]}" -gt 1 ]]; then
+    echo "error: several devices are connected (${DEVICES[*]}); choose one with --device SERIAL" >&2
+    exit 1
+  fi
+  DEVICE="${DEVICES[0]}"
 fi
-if [[ "${#DEVICES[@]}" -gt 1 ]]; then
-  echo "error: more than one Android device is connected; select one with ANDROID_SERIAL" >&2
-  exit 1
-fi
+export ANDROID_SERIAL="${DEVICE}"
 
-export ANDROID_SERIAL="${ANDROID_SERIAL:-${DEVICES[0]}}"
-PACKAGE_NAME="com.example.auraf_benchmark_harness"
+EXPECTED_ROWS=$((24 * REPS))
+MODEL="$(adb shell getprop ro.product.model | tr -d '\r')"
+echo "==> Device ${DEVICE} (${MODEL}) · ${REPS} repetition(s) · ${EXPECTED_ROWS} runs"
+
+mkdir -p "${RESULTS_DIR}"
+rm -f "${RESULTS_DIR}"/m2_benchmark_results.csv "${RESULTS_DIR}"/m2_device_state_samples.csv \
+      "${RESULTS_DIR}"/m2_run_summary.json "${RESULTS_DIR}"/auraf_telemetry.db
+
 cd "${ROOT_DIR}/benchmark_harness"
-flutter pub get
+flutter pub get >/dev/null
+AURAF_RESULTS_DIR="${RESULTS_DIR}" flutter drive \
+  -d "${DEVICE}" \
+  --driver=test_driver/integration_test.dart \
+  --target=integration_test/m2_benchmark_test.dart \
+  --dart-define=AURAF_REPS="${REPS}" \
+  --dart-define=AURAF_COOLDOWN_C="${COOLDOWN}" \
+  --dart-define=AURAF_SEED="${SEED}"
 
-LOG_OUTPUT="$(mktemp)"
-flutter test integration_test/m2_benchmark_test.dart 2>&1 | tee "${LOG_OUTPUT}"
-
-cd "${ROOT_DIR}"
-mkdir -p "$(dirname "${RESULT_FILE}")"
-
-# 1. Primary: Extract tagged CSV directly from test stdout (reliable across all Android OEMs)
-if grep -q "AURAF_CSV_START" "${LOG_OUTPUT}"; then
-  sed -n '/AURAF_CSV_START/,/AURAF_CSV_END/{ /AURAF_CSV_START/d; /AURAF_CSV_END/d; p; }' "${LOG_OUTPUT}" > "${RESULT_FILE}"
-# 2. Secondary fallback: Pull from device storage
-elif adb pull /sdcard/Download/m2_benchmark_results.csv "${RESULT_FILE}" >/dev/null 2>&1; then
-  :
-# 3. Tertiary fallback: run-as app data
-elif adb exec-out run-as "${PACKAGE_NAME}" cat "app_flutter/m2_benchmark_results.csv" > "${RESULT_FILE}" 2>/dev/null; then
-  :
-else
-  echo "error: could not retrieve benchmark CSV from device or test stream" >&2
-  rm -f "${LOG_OUTPUT}"
-  exit 1
-fi
-rm -f "${LOG_OUTPUT}"
-if [[ ! -f "${RESULT_FILE}" ]]; then
-  echo "error: benchmark did not create ${RESULT_FILE}" >&2
-  exit 1
-fi
-
+# ---- Validate the exported CSV against the shared data contract ----------
+[[ -f "${RESULT_FILE}" ]] || { echo "error: benchmark did not produce ${RESULT_FILE}" >&2; exit 1; }
 EXPECTED_HEADER='run_id,timestamp,device_model,network_condition,context_budget,placement,ttft_ms,total_latency_ms,tokens_per_sec,energy_mah,peak_memory_mb,temp_celsius,cost_usd,quality_score,constraint_violated'
-actual_header="$(head -n 1 "${RESULT_FILE}")"
-if [[ "${actual_header}" != "${EXPECTED_HEADER}" ]]; then
-  echo "error: CSV header does not match the shared data contract" >&2
-  exit 1
-fi
+[[ "$(head -n 1 "${RESULT_FILE}")" == "${EXPECTED_HEADER}" ]] ||
+  { echo "error: CSV header does not match docs/SHARED_DATA_CONTRACT.md" >&2; exit 1; }
 
 row_count="$(tail -n +2 "${RESULT_FILE}" | sed '/^[[:space:]]*$/d' | wc -l)"
-if [[ "${row_count}" -ne 24 ]]; then
-  echo "error: expected 24 benchmark rows, found ${row_count}" >&2
-  exit 1
-fi
+[[ "${row_count}" -eq "${EXPECTED_ROWS}" ]] ||
+  { echo "error: expected ${EXPECTED_ROWS} rows, found ${row_count}" >&2; exit 1; }
 
-echo "M2 benchmark complete: ${RESULT_FILE} (24 records)"
+bad_cols="$(tail -n +2 "${RESULT_FILE}" | awk -F, 'NF && NF != 15' | wc -l)"
+[[ "${bad_cols}" -eq 0 ]] || { echo "error: ${bad_cols} rows do not have 15 columns" >&2; exit 1; }
+
+echo
+echo "==> Mean per cell (network, context, placement)"
+tail -n +2 "${RESULT_FILE}" | awk -F, '
+  { k=$4" "$5" "$6; n[k]++; ttft[k]+=$7; tot[k]+=$8; e[k]+=$10; v[k]+=$15 }
+  END {
+    printf "%-13s %5s %-7s %3s %9s %9s %8s %5s\n", "network","ctx","place","n","ttft_ms","total_ms","mAh","viol"
+    for (k in n) { split(k, a, " ");
+      printf "%-13s %5s %-7s %3d %9.1f %9.1f %8.3f %5d\n", a[1], a[2], a[3], n[k], ttft[k]/n[k], tot[k]/n[k], e[k]/n[k], v[k] }
+  }' | sort -k1,1 -k2,2n -k3,3
+
+echo
+echo "M2 benchmark complete: ${row_count} records validated"
+for f in m2_benchmark_results.csv m2_device_state_samples.csv m2_run_summary.json auraf_telemetry.db; do
+  [[ -f "${RESULTS_DIR}/${f}" ]] && echo "  results/${f}"
+done
